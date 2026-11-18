@@ -119,7 +119,19 @@ class BSplineSpace(LinearFunctionSpace):
         parametric_coordinates: Union[np.ndarray, csdl.Variable],
         parametric_derivative_orders: Optional[Tuple[int, ...]] = None,
     ) -> Union[np.ndarray, csdl.Variable]:
-        """Evaluate B-spline functions at the given parametric coordinates."""
+        """Evaluate B-spline functions at the given parametric coordinates.
+
+        Coefficients of shape ``(*batch, *coefficients_shape, d)``, with one or more
+        leading batch axes, hold several functions of this space; they are evaluated
+        together with one basis matrix and give values of shape ``(*batch, q, d)``. A
+        derivative order may be given as an int for a one-dimensional space.
+        """
+        if isinstance(parametric_derivative_orders, (int, np.integer)):
+            if self.num_parametric_dimensions != 1:
+                raise ValueError("an int parametric_derivative_orders is only accepted for a 1D space; "
+                                 "give one order per parametric dimension")
+            parametric_derivative_orders = (int(parametric_derivative_orders),)
+
         if not isinstance(coefficients, (np.ndarray, csdl.Variable)):
             raise TypeError(
                 f"coefficients must be a numpy array or a CSDL variable, "
@@ -141,6 +153,11 @@ class BSplineSpace(LinearFunctionSpace):
             )
 
         non_csdl = isinstance(coefficients, np.ndarray)
+
+        batch_shape = self._batch_shape(coefficients)
+        if batch_shape:
+            return self._evaluate_batch(coefficients, parametric_coordinates, parametric_derivative_orders,
+                                        batch_shape)
 
         if isinstance(parametric_coordinates, np.ndarray):
             basis_matrix = compute_basis_matrix_numpy(
@@ -182,6 +199,76 @@ class BSplineSpace(LinearFunctionSpace):
                 values = values.value
 
             return values
+
+    def _batch_shape(self, coefficients: Union[np.ndarray, csdl.Variable]) -> Tuple[int, ...]:
+        """The leading batch axes of ``coefficients`` of shape ``(*batch, *coefficients_shape, d)``.
+
+        Empty for the unbatched layouts: ``(*coefficients_shape, d)`` or any flattened form.
+        """
+        shape = tuple(coefficients.shape)
+        k = len(self.coefficients_shape)
+        if len(shape) > k + 1 and shape[-(k + 1):-1] == tuple(self.coefficients_shape):
+            return shape[:-(k + 1)]
+        return ()
+
+    def _evaluate_batch(self, coefficients, parametric_coordinates, parametric_derivative_orders, batch_shape):
+        """Evaluate a batch of functions of this space with one basis matrix.
+
+        Parameters
+        ----------
+        coefficients : np.ndarray or csdl.Variable, shape (*batch, *coefficients_shape, d)
+        parametric_coordinates : np.ndarray or csdl.Variable, shape (q, num_parametric_dimensions)
+        parametric_derivative_orders : tuple of int or None
+        batch_shape : tuple of int
+
+        Returns
+        -------
+        np.ndarray or csdl.Variable, shape (*batch, q, d)
+        """
+        n = int(np.prod(self.coefficients_shape))
+        m = int(np.prod(batch_shape))
+        d = coefficients.shape[-1]
+        q = parametric_coordinates.shape[0]
+        basis = self.compute_basis_matrix(parametric_coordinates, parametric_derivative_orders)   # (q, n)
+        if isinstance(coefficients, np.ndarray) and not isinstance(basis, csdl.Variable):
+            # (n, m d): every function's coordinates are columns of one product
+            columns = np.moveaxis(coefficients.reshape((m, n, d)), 1, 0).reshape((n, m * d))
+            values = np.moveaxis(np.asarray(basis @ columns).reshape((q, m, d)), 1, 0)
+            return values.reshape((*batch_shape, q, d))
+        if isinstance(coefficients, np.ndarray):
+            coefficients = csdl.Variable(value=coefficients)
+        if not isinstance(basis, csdl.Variable):
+            basis = basis.toarray()
+        values = csdl.einsum(basis, coefficients.reshape((m, n, d)), action="qn,mnd->mqd")
+        return values.reshape((*batch_shape, q, d))
+
+    @classmethod
+    def curves(cls, control_points, degree: int = 3, knots: Optional[np.ndarray] = None) -> lfs.Function:
+        """B-spline curves of one space, as one Function: one curve, or a batch of them.
+
+        Parameters
+        ----------
+        control_points : csdl.Variable or array_like, shape (n, d) or (*batch, n, d)
+            The control points of each curve. Arrays become CSDL variables (which needs an
+            active recorder).
+        degree : int, optional
+            Polynomial degree, less than n.
+        knots : array_like, shape (n + degree + 1,), optional
+            Knot vector; the default is clamped and uniform on [0, 1].
+
+        Returns
+        -------
+        lfs.Function
+            A function of a one-dimensional space with n coefficients; evaluated at q
+            parameters it gives shape (q, d), or (*batch, q, d) for a batch.
+        """
+        if not isinstance(control_points, csdl.Variable):
+            control_points = csdl.Variable(value=np.asarray(control_points, dtype=float))
+        n = control_points.shape[-2]
+        if knots is not None:
+            knots = (np.asarray(knots, dtype=float),)
+        space = cls(num_parametric_dimensions=1, degree=(degree,), coefficients_shape=(n,), knots=knots)
+        return lfs.Function(space=space, coefficients=control_points)
 
     def _generate_parametric_grid(self, knot_vectors: Sequence[np.ndarray], N: int) -> np.ndarray:
         """Generate a tensor-grid of parametric sample points."""
